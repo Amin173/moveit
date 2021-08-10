@@ -41,96 +41,246 @@
 #include <moveit/kinematic_constraints/utils.h>
 #include <moveit/move_group/capability_names.h>
 
+// Name of this class for logging
+static const std::string LOGNAME = "execute_trajectory_action_capability";
+
 namespace move_group
 {
 MoveGroupExecuteTrajectoryAction::MoveGroupExecuteTrajectoryAction() : MoveGroupCapability("ExecuteTrajectoryAction")
 {
 }
 
+MoveGroupExecuteTrajectoryAction::~MoveGroupExecuteTrajectoryAction()
+{
+  if (execute_thread_)
+  {
+    terminate_mutex_.lock();
+    need_to_terminate_ = true;
+    terminate_mutex_.unlock();
+    execute_condition_.notify_all();
+    execute_thread_->join();
+  }
+}
+
 void MoveGroupExecuteTrajectoryAction::initialize()
 {
   // start the move action server
-  execute_action_server_ = std::make_unique<actionlib::SimpleActionServer<moveit_msgs::ExecuteTrajectoryAction>>(
-      root_node_handle_, EXECUTE_ACTION_NAME, [this](const auto& goal) { executePathCallback(goal); }, false);
-  execute_action_server_->registerPreemptCallback([this] { preemptExecuteTrajectoryCallback(); });
+  execute_action_server_ = std::make_unique<ExecuteTrajectoryActionServer>(
+      root_node_handle_, EXECUTE_ACTION_NAME, [this](const auto& goal) { goalCallback(goal); }, false);
   execute_action_server_->start();
+
+  need_to_terminate_ = false;
+  execute_thread_ = std::make_unique<std::thread>(&MoveGroupExecuteTrajectoryAction::executeLoop, this);
 }
 
-void MoveGroupExecuteTrajectoryAction::executePathCallback(const moveit_msgs::ExecuteTrajectoryGoalConstPtr& goal)
+void MoveGroupExecuteTrajectoryAction::executeLoop()
 {
-  moveit_msgs::ExecuteTrajectoryResult action_res;
-  if (!context_->trajectory_execution_manager_)
+  while (root_node_handle_.ok())
   {
-    const std::string response = "Cannot execute trajectory since ~allow_trajectory_execution was set to false";
-    action_res.error_code.val = moveit_msgs::MoveItErrorCodes::CONTROL_FAILED;
-    execute_action_server_->setAborted(action_res, response);
-    return;
-  }
+    {
+      std::unique_lock<std::mutex> ulock(execute_mutex_, std::try_to_lock);
+      while (new_goals_.empty() && canceled_goals_.empty())
+        execute_condition_.wait(ulock);
+    }
 
-  executePath(goal, action_res);
+    clearInactiveGoals();
 
-  const std::string response = getActionResultString(action_res.error_code, false, false);
-  if (action_res.error_code.val == moveit_msgs::MoveItErrorCodes::SUCCESS)
-  {
-    execute_action_server_->setSucceeded(action_res, response);
-  }
-  else if (action_res.error_code.val == moveit_msgs::MoveItErrorCodes::PREEMPTED)
-  {
-    execute_action_server_->setPreempted(action_res, response);
-  }
-  else
-  {
-    execute_action_server_->setAborted(action_res, response);
-  }
+    {
+      std::lock_guard<std::mutex> terminate_lock(terminate_mutex_);
+      if (need_to_terminate_)
+        break;
+    }
 
-  setExecuteTrajectoryState(IDLE);
+    clearInactiveGoals();
+
+    {
+      std::unique_lock<std::mutex> ulock(goal_mutex_);
+
+      ROS_DEBUG_NAMED(getName(), "new_goals: %zu, canceled_goals: %zu", new_goals_.size(), canceled_goals_.size());
+
+      // Process requests for canceling goals
+      for (auto& canceled_goal : canceled_goals_)
+      {
+        context_->trajectory_execution_manager_->stopExecution(canceled_goal->getGoal()->trajectory);
+        ;
+        cancelGoal(*canceled_goal);
+      }
+      canceled_goals_.clear();
+
+      // Process requests for new goals
+      if (new_goals_.empty())
+        return;
+
+      if (!context_->trajectory_execution_manager_)
+      {
+        for (auto ng : new_goals_)
+        {
+          moveit_msgs::ExecuteTrajectoryResult action_res;
+          const std::string response = "Cannot execute trajectory since ~allow_trajectory_execution was set to false";
+          action_res.error_code.val = moveit_msgs::MoveItErrorCodes::CONTROL_FAILED;
+          ng->setCanceled(action_res, response);
+        }
+        std::unique_lock<std::mutex> ulock(goal_mutex_);
+        new_goals_.clear();
+        canceled_goals_.clear();
+        continue;
+      }
+
+      if (context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+      {
+        for (auto ng : new_goals_)
+        {
+          auto goal = *ng;
+          active_goals_.emplace(std::make_pair(ng, std::make_unique<std::thread>([this, &ng]() { executePath(ng); })));
+              std::make_pair(std::move(ng), std::make_unique<std::thread>([this, &goal]() { executePath(goal); })));
+        }
+        new_goals_.clear();
+      }
+      else
+      {
+        // preempt all but the most recent new goal
+        auto new_goal = std::move(new_goals_.back());
+        new_goals_.pop_back();
+
+        for (auto& ng : new_goals_)
+          cancelGoal(*ng);
+        new_goals_.clear();
+
+        goal_mutex_.unlock();
+
+        // check if we need to send a preempted message for the goal that we're currently pursuing
+        if (isActive(current_goal_))
+        {
+          // Stop current execution and then cancel current goal
+          context_->trajectory_execution_manager_->stopExecution(true);
+          ;
+          cancelGoal(current_goal_);
+        }
+
+        current_goal_ = *new_goal;
+
+        active_goals_mutex_.lock();
+        active_goals_.emplace(std::make_pair(std::move(new_goal),
+        active_goals_.emplace(
+            std::make_pair(new_goal, std::make_unique<std::thread>([this, &new_goal]() { executePath(new_goal); })));
+        active_goals_mutex_.unlock();
+      }
+    }
+  }
 }
 
-void MoveGroupExecuteTrajectoryAction::executePath(const moveit_msgs::ExecuteTrajectoryGoalConstPtr& goal,
-                                                   moveit_msgs::ExecuteTrajectoryResult& action_res)
+void MoveGroupExecuteTrajectoryAction::clearInactiveGoals()
 {
-  ROS_INFO_NAMED(getName(), "Execution request received");
-
-  context_->trajectory_execution_manager_->clear();
-  if (context_->trajectory_execution_manager_->push(goal->trajectory))
+  // clear inactive goals
+  std::lock_guard<std::mutex> slock(active_goals_mutex_);
+  auto it = active_goals_.begin();
+  while (it != active_goals_.end())
   {
-    setExecuteTrajectoryState(MONITOR);
-    context_->trajectory_execution_manager_->execute();
-    moveit_controller_manager::ExecutionStatus status = context_->trajectory_execution_manager_->waitForExecution();
-    if (status == moveit_controller_manager::ExecutionStatus::SUCCEEDED)
+    auto& goal_handle = it->first;
+    auto& goal_thread = it->second;
+    if (!isActive(*goal_handle))
     {
-      action_res.error_code.val = moveit_msgs::MoveItErrorCodes::SUCCESS;
-    }
-    else if (status == moveit_controller_manager::ExecutionStatus::PREEMPTED)
-    {
-      action_res.error_code.val = moveit_msgs::MoveItErrorCodes::PREEMPTED;
-    }
-    else if (status == moveit_controller_manager::ExecutionStatus::TIMED_OUT)
-    {
-      action_res.error_code.val = moveit_msgs::MoveItErrorCodes::TIMED_OUT;
+      if (goal_thread->joinable())
+        goal_thread->join();
+      it = active_goals_.erase(it);
     }
     else
-    {
-      action_res.error_code.val = moveit_msgs::MoveItErrorCodes::CONTROL_FAILED;
-    }
-    ROS_INFO_STREAM_NAMED(getName(), "Execution completed: " << status.asString());
+      it++;
+  }
+}
+
+void MoveGroupExecuteTrajectoryAction::cancelGoal(ExecuteTrajectoryActionServer::GoalHandle& goal)
+{
+  moveit_msgs::ExecuteTrajectoryResult action_res;
+  const std::string response = "This goal was canceled because another goal was recieved by the MoveIt action server";
+  action_res.error_code.val = moveit_msgs::MoveItErrorCodes::PREEMPTED;
+  goal.setCanceled(action_res, response);
+}
+
+bool MoveGroupExecuteTrajectoryAction::isActive(ExecuteTrajectoryActionServer::GoalHandle& goal)
+{
+  if (!goal.getGoal())
+    return false;
+  unsigned int status = goal.getGoalStatus().status;
+  return status == actionlib_msgs::GoalStatus::ACTIVE || status == actionlib_msgs::GoalStatus::PREEMPTING;
+}
+
+void MoveGroupExecuteTrajectoryAction::goalCallback(ExecuteTrajectoryActionServer::GoalHandle goal_handle)
+{
+  std::lock_guard<std::mutex> slock(goal_mutex_);
+  new_goals_.push_back(std::make_unique<ExecuteTrajectoryActionServer::GoalHandle>(goal_handle));
+  execute_condition_.notify_all();
+}
+
+void MoveGroupExecuteTrajectoryAction::cancelCallback(ExecuteTrajectoryActionServer::GoalHandle goal_handle)
+{
+  std::lock_guard<std::mutex> slock(goal_mutex_);
+  canceled_goals_.push_back(std::make_unique<ExecuteTrajectoryActionServer::GoalHandle>(goal_handle));
+  execute_condition_.notify_all();
+}
+
+void MoveGroupExecuteTrajectoryAction::executePath(
+    std::shared_ptr<ExecuteTrajectoryActionServer::GoalHandle> goal_handle_ptr)
+{
+  ROS_INFO_NAMED(LOGNAME, "Goal received (ExecuteTrajectoryActionServer)");
+  ROS_DEBUG_STREAM_NAMED(LOGNAME, "Goal ID" << goal_handle_ptr->getGoalID());
+
+  goal_handle_ptr->setAccepted("This goal has been accepted by the action server");
+
+  if (!context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+    context_->trajectory_execution_manager_->clear();
+
+  auto executionCallback = [this, goal_handle_ptr](const moveit_controller_manager::ExecutionStatus& status) {
+    setExecuteTrajectoryState(IDLE, *goal_handle_ptr);
+    sendGoalResponse(*goal_handle_ptr, status);
+    ROS_INFO_STREAM_NAMED(LOGNAME, "Execution completed: " << status.asString());
+    execute_condition_.notify_all();
+  };
+
+  if (context_->trajectory_execution_manager_->push(goal_handle_ptr->getGoal()->trajectory, "", executionCallback))
+  {
+    setExecuteTrajectoryState(MONITOR, *goal_handle_ptr);
+    if (!context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+      context_->trajectory_execution_manager_->execute(executionCallback, true);
   }
   else
   {
-    action_res.error_code.val = moveit_msgs::MoveItErrorCodes::CONTROL_FAILED;
+    ROS_ERROR_NAMED(LOGNAME, "Failed to pushed trajectory");
   }
 }
 
-void MoveGroupExecuteTrajectoryAction::preemptExecuteTrajectoryCallback()
+void MoveGroupExecuteTrajectoryAction::sendGoalResponse(
+    ExecuteTrajectoryActionServer::GoalHandle& goal, const moveit_controller_manager::ExecutionStatus& execution_status)
 {
-  context_->trajectory_execution_manager_->stopExecution(true);
+  setExecuteTrajectoryState(IDLE, goal);
+
+  moveit_msgs::ExecuteTrajectoryResult action_res;
+
+  if (execution_status == moveit_controller_manager::ExecutionStatus::SUCCEEDED)
+    action_res.error_code.val = moveit_msgs::MoveItErrorCodes::SUCCESS;
+  else if (execution_status == moveit_controller_manager::ExecutionStatus::PREEMPTED)
+    action_res.error_code.val = moveit_msgs::MoveItErrorCodes::PREEMPTED;
+  else if (execution_status == moveit_controller_manager::ExecutionStatus::TIMED_OUT)
+    action_res.error_code.val = moveit_msgs::MoveItErrorCodes::TIMED_OUT;
+  else  // ABORTED, FAILED, UNKNOWN
+    action_res.error_code.val = moveit_msgs::MoveItErrorCodes::CONTROL_FAILED;
+
+  ROS_DEBUG_STREAM_NAMED(LOGNAME, "Execution completed: " << execution_status.asString());
+
+  const std::string response = this->getActionResultString(action_res.error_code, false, false);
+
+  if (action_res.error_code.val == moveit_msgs::MoveItErrorCodes::SUCCESS)
+    goal.setSucceeded(action_res, response);
+  else
+    goal.setAborted(action_res, response);
 }
 
-void MoveGroupExecuteTrajectoryAction::setExecuteTrajectoryState(MoveGroupState state)
+void MoveGroupExecuteTrajectoryAction::setExecuteTrajectoryState(const MoveGroupState& state,
+                                                                 ExecuteTrajectoryActionServer::GoalHandle& goal)
 {
   moveit_msgs::ExecuteTrajectoryFeedback execute_feedback;
   execute_feedback.state = stateToStr(state);
-  execute_action_server_->publishFeedback(execute_feedback);
+  goal.publishFeedback(execute_feedback);
 }
 
 }  // namespace move_group

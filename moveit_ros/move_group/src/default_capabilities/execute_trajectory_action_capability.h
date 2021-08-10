@@ -41,27 +41,55 @@
 #pragma once
 
 #include <moveit/move_group/move_group_capability.h>
-#include <actionlib/server/simple_action_server.h>
+#include <actionlib/server/action_server.h>
 #include <moveit_msgs/ExecuteTrajectoryAction.h>
-#include <memory>
+#include <moveit/controller_manager/controller_manager.h>
 
+#include <condition_variable>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+typedef actionlib::ActionServer<moveit_msgs::ExecuteTrajectoryAction> ExecuteTrajectoryActionServer;
 namespace move_group
 {
 class MoveGroupExecuteTrajectoryAction : public MoveGroupCapability
 {
 public:
   MoveGroupExecuteTrajectoryAction();
+  ~MoveGroupExecuteTrajectoryAction();
 
   void initialize() override;
 
 private:
-  void executePathCallback(const moveit_msgs::ExecuteTrajectoryGoalConstPtr& goal);
-  void executePath(const moveit_msgs::ExecuteTrajectoryGoalConstPtr& goal,
-                   moveit_msgs::ExecuteTrajectoryResult& action_res);
-  void preemptExecuteTrajectoryCallback();
-  void setExecuteTrajectoryState(MoveGroupState state);
+  void executeLoop();
+  bool isActive(ExecuteTrajectoryActionServer::GoalHandle& goal_handle);
+  void cancelGoal(ExecuteTrajectoryActionServer::GoalHandle& goal);
+  void goalCallback(ExecuteTrajectoryActionServer::GoalHandle goal_handle);
+  void cancelCallback(ExecuteTrajectoryActionServer::GoalHandle goal_handle);
+  void clearInactiveGoals();
 
-  std::unique_ptr<actionlib::SimpleActionServer<moveit_msgs::ExecuteTrajectoryAction> > execute_action_server_;
+  void executePath(std::shared_ptr<ExecuteTrajectoryActionServer::GoalHandle> goal_handle_ptr);
+  void setExecuteTrajectoryState(const MoveGroupState& state, ExecuteTrajectoryActionServer::GoalHandle& goal);
+  void sendGoalResponse(ExecuteTrajectoryActionServer::GoalHandle& goal,
+                        const moveit_controller_manager::ExecutionStatus& execution_status);
+
+  std::mutex goal_mutex_;
+  ExecuteTrajectoryActionServer::GoalHandle current_goal_;
+  std::deque<std::shared_ptr<ExecuteTrajectoryActionServer::GoalHandle>> new_goals_;
+  std::deque<std::unique_ptr<ExecuteTrajectoryActionServer::GoalHandle>> canceled_goals_;
+  std::map<std::shared_ptr<ExecuteTrajectoryActionServer::GoalHandle>, std::unique_ptr<std::thread>> active_goals_;
+  std::mutex active_goals_mutex_;
+
+  std::unique_ptr<std::thread> execute_thread_;
+  std::condition_variable execute_condition_;
+  std::mutex execute_mutex_;
+
+  std::mutex terminate_mutex_;
+  bool need_to_terminate_;
+
+  std::unique_ptr<ExecuteTrajectoryActionServer> execute_action_server_;
 };
 
 }  // namespace move_group
