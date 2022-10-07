@@ -109,7 +109,9 @@ public:
     std::vector<ros::Time> time_index_;
   };
 
-  /// Data structure that represents information necessary to execute an interdependent set of trajectories
+  /// Data structure that represents information necessary to execute an interdependent sequence of trajectories. For a
+  /// sequence of trajectories the necessary controllers for all the trajectories in the sequence are blocked until the
+  /// sequence is completed.
   struct SequentialTrajectoryExecutionContext
   {
     /// Set of interdependent trajectories
@@ -353,8 +355,12 @@ private:
   bool selectControllers(const std::set<std::string>& actuated_joints,
                          const std::vector<std::string>& available_controllers,
                          std::vector<std::string>& selected_controllers);
+  // Loop through events to simultaneously execute trajectories and sequences of trajectories
   void runEventManager();
+  // Validate that sequences of trajectories are ready for execution; trajectory matches current robot state,
+  // controllers are available, and optionally check collision with active trajectories and the current planning scene
   bool validateTrajectories(const SequentialTrajectoryExecutionContext& meta_context);
+  // Send trajectory to be executed in the corresponding controller(s)
   bool executeTrajectory(const std::shared_ptr<SequentialTrajectoryExecutionContext> meta_context,
                          const std::size_t index);
   bool waitForRobotToStop(const TrajectoryExecutionContext& context, double wait_time = 1.0);
