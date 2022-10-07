@@ -39,6 +39,8 @@ POSSIBILITY OF SUCH DAMAGE.
     <arg name="fake_execution_type" value="interpolate" /> <!-- we need to actually execute the trajectory to test preemption -->
   </include>
 
+  <param name="move_group/trajectory_execution/allow_simultaneous_execution" value="false"/>
+
   <!-- run test -->
   <test pkg="pilz_industrial_motion_planner" test-name="integrationtest_sequence_action_preemption" type="integrationtest_sequence_action_preemption" time-limit="20.0">
     <param name="joint_position_tolerance" value="0.01" />
