@@ -37,34 +37,61 @@
 #pragma once
 
 #include <moveit/move_group/move_group_capability.h>
-#include <actionlib/server/simple_action_server.h>
+#include <actionlib/server/action_server.h>
 #include <moveit_msgs/MoveGroupAction.h>
+#include <condition_variable>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 
+typedef actionlib::ActionServer<moveit_msgs::MoveGroupAction> MoveGroupActionServer;
 namespace move_group
 {
 class MoveGroupMoveAction : public MoveGroupCapability
 {
 public:
   MoveGroupMoveAction();
+  ~MoveGroupMoveAction();
 
   void initialize() override;
 
 private:
-  void executeMoveCallback(const moveit_msgs::MoveGroupGoalConstPtr& goal);
-  void executeMoveCallbackPlanAndExecute(const moveit_msgs::MoveGroupGoalConstPtr& goal,
+  void executeLoop();
+  bool isActive(MoveGroupActionServer::GoalHandle& goal_handle);
+  void cancelGoal(MoveGroupActionServer::GoalHandle& goal_handle);
+  void goalCallback(MoveGroupActionServer::GoalHandle goal_handle);
+  void cancelCallback(MoveGroupActionServer::GoalHandle goal_handle);
+  void clearInactiveGoals();
+
+  void executeMoveCallback(std::shared_ptr<MoveGroupActionServer::GoalHandle>& goal_handle_ptr);
+  void executeMoveCallbackPlanAndExecute(MoveGroupActionServer::GoalHandle& goal_handle,
                                          moveit_msgs::MoveGroupResult& action_res);
   void executeMoveCallbackPlanOnly(const moveit_msgs::MoveGroupGoalConstPtr& goal,
                                    moveit_msgs::MoveGroupResult& action_res);
-  void startMoveExecutionCallback();
-  void startMoveLookCallback();
-  void preemptMoveCallback();
-  void setMoveState(MoveGroupState state);
+  void startMoveExecutionCallback(MoveGroupActionServer::GoalHandle& goal_handle);
+  void startMoveLookCallback(MoveGroupActionServer::GoalHandle& goal_handle);
+  void setMoveState(MoveGroupState state, MoveGroupActionServer::GoalHandle& goal_handle);
   bool planUsingPlanningPipeline(const planning_interface::MotionPlanRequest& req,
-                                 plan_execution::ExecutableMotionPlan& plan);
+                                 plan_execution::ExecutableMotionPlan& plan,
+                                 MoveGroupActionServer::GoalHandle& goal_handle);
 
-  std::unique_ptr<actionlib::SimpleActionServer<moveit_msgs::MoveGroupAction> > move_action_server_;
+  std::unique_ptr<MoveGroupActionServer> move_action_server_;
   moveit_msgs::MoveGroupFeedback move_feedback_;
+
+  std::mutex goal_mutex_;
+  MoveGroupActionServer::GoalHandle current_goal_;
+  std::deque<std::shared_ptr<MoveGroupActionServer::GoalHandle>> new_goals_;
+  std::deque<std::unique_ptr<MoveGroupActionServer::GoalHandle>> canceled_goals_;
+  std::map<std::shared_ptr<MoveGroupActionServer::GoalHandle>, std::unique_ptr<std::thread>> active_goals_;
+  std::mutex active_goals_mutex_;
+
+  std::unique_ptr<std::thread> execute_thread_;
+  std::condition_variable execute_condition_;
+  std::mutex execute_mutex_;
+
+  std::mutex terminate_mutex_;
+  bool need_to_terminate_;
 
   MoveGroupState move_state_;
   bool preempt_requested_;
