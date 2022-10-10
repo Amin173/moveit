@@ -56,32 +56,178 @@ namespace pilz_industrial_motion_planner
 MoveGroupSequenceAction::MoveGroupSequenceAction() : MoveGroupCapability("SequenceAction")
 {
 }
+MoveGroupSequenceAction::~MoveGroupSequenceAction()
+{
+  if (execute_thread_)
+  {
+    terminate_mutex_.lock();
+    need_to_terminate_ = true;
+    terminate_mutex_.unlock();
+    execute_condition_.notify_all();
+    execute_thread_->join();
+  }
+}
 
 void MoveGroupSequenceAction::initialize()
 {
   // start the move action server
   ROS_INFO_STREAM("initialize move group sequence action");
-  move_action_server_ = std::make_unique<actionlib::SimpleActionServer<moveit_msgs::MoveGroupSequenceAction>>(
-      root_node_handle_, "sequence_move_group", [this](const auto& goal) { executeSequenceCallback(goal); }, false);
-  move_action_server_->registerPreemptCallback([this] { preemptMoveCallback(); });
+  move_action_server_ = std::make_unique<MoveGroupSequenceActionServer>(
+      root_node_handle_, "sequence_move_group", [this](const auto& goal) { goalCallback(goal); },
+      [this](const auto& goal) { cancelCallback(goal); }, false);
   move_action_server_->start();
 
   command_list_manager_ = std::make_unique<pilz_industrial_motion_planner::CommandListManager>(
       ros::NodeHandle("~"), context_->planning_scene_monitor_->getRobotModel());
+
+  need_to_terminate_ = false;
+  execute_thread_ = std::make_unique<std::thread>(&MoveGroupSequenceAction::executeLoop, this);
 }
 
-void MoveGroupSequenceAction::executeSequenceCallback(const moveit_msgs::MoveGroupSequenceGoalConstPtr& goal)
+void MoveGroupSequenceAction::executeLoop()
 {
-  setMoveState(move_group::PLANNING);
+  while (root_node_handle_.ok())
+  {
+    {
+      std::unique_lock<std::mutex> ulock(execute_mutex_, std::try_to_lock);
+      while (new_goals_.empty() && canceled_goals_.empty())
+        execute_condition_.wait(ulock);
+    }
+
+    {
+      std::lock_guard<std::mutex> terminate_lock(terminate_mutex_);
+      if (need_to_terminate_)
+        break;
+    }
+
+    clearInactiveGoals();
+
+    {
+      std::unique_lock<std::mutex> ulock(goal_mutex_);
+
+      ROS_DEBUG_NAMED(getName(), "new_goals: %zu, canceled_goals: %zu", new_goals_.size(), canceled_goals_.size());
+
+      // Process requests for canceling goals
+      for (auto& canceled_goal : canceled_goals_)
+      {
+        // TODO (cambel): this stops every execution, not just the one related to the goals
+        if (*canceled_goal == current_goal_)
+          context_->plan_execution_->stop();
+        cancelGoal(*canceled_goal);
+      }
+      canceled_goals_.clear();
+
+      // Process requests for new goals
+      if (new_goals_.empty())
+        return;
+
+      if (context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+      {
+        for (auto ng : new_goals_)
+        {
+          auto goal = *ng;
+          active_goals_.emplace(std::make_pair(
+              std::move(ng), std::make_unique<std::thread>([this, &goal]() { executeSequenceCallback(goal); })));
+        }
+        new_goals_.clear();
+      }
+      else
+      {
+        // preempt all but the most recent new goal
+        auto new_goal = std::move(new_goals_.back());
+        new_goals_.pop_back();
+
+        for (auto& ng : new_goals_)
+          cancelGoal(*ng);
+        new_goals_.clear();
+
+        goal_mutex_.unlock();
+
+        // check if we need to send a preempted message for the goal that we're currently pursuing
+        if (isActive(current_goal_))
+        {
+          // Stop current execution and then cancel current goal
+          context_->plan_execution_->stop();
+          cancelGoal(current_goal_);
+        }
+
+        current_goal_ = *new_goal;
+
+        active_goals_mutex_.lock();
+        active_goals_.emplace(std::make_pair(
+            std::move(new_goal), std::make_unique<std::thread>([this]() { executeSequenceCallback(current_goal_); })));
+        active_goals_mutex_.unlock();
+      }
+    }
+  }
+}
+
+void MoveGroupSequenceAction::clearInactiveGoals()
+{
+  // clear inactive goals
+  std::lock_guard<std::mutex> slock(active_goals_mutex_);
+  auto it = active_goals_.begin();
+  while (it != active_goals_.end())
+  {
+    auto& goal_handle = it->first;
+    auto& goal_thread = it->second;
+    if (!isActive(*goal_handle))
+    {
+      if (goal_thread->joinable())
+        goal_thread->join();
+      it = active_goals_.erase(it);
+    }
+    else
+      it++;
+  }
+}
+
+void MoveGroupSequenceAction::cancelGoal(MoveGroupSequenceActionServer::GoalHandle& goal)
+{
+  moveit_msgs::MoveGroupSequenceResult action_res;
+  const std::string response = "This goal was canceled because another goal was recieved by the MoveIt action server";
+  action_res.response.error_code.val = moveit_msgs::MoveItErrorCodes::PREEMPTED;
+  goal.setCanceled(action_res, response);
+}
+
+bool MoveGroupSequenceAction::isActive(MoveGroupSequenceActionServer::GoalHandle& goal)
+{
+  if (!goal.getGoal())
+    return false;
+  unsigned int status = goal.getGoalStatus().status;
+  return status == actionlib_msgs::GoalStatus::ACTIVE || status == actionlib_msgs::GoalStatus::PREEMPTING;
+}
+
+void MoveGroupSequenceAction::goalCallback(MoveGroupSequenceActionServer::GoalHandle goal_handle)
+{
+  std::lock_guard<std::mutex> slock(goal_mutex_);
+  new_goals_.push_back(std::make_unique<MoveGroupSequenceActionServer::GoalHandle>(goal_handle));
+  execute_condition_.notify_all();
+}
+
+void MoveGroupSequenceAction::cancelCallback(MoveGroupSequenceActionServer::GoalHandle goal_handle)
+{
+  std::lock_guard<std::mutex> slock(goal_mutex_);
+  canceled_goals_.push_back(std::make_unique<MoveGroupSequenceActionServer::GoalHandle>(goal_handle));
+  execute_condition_.notify_all();
+}
+
+void MoveGroupSequenceAction::executeSequenceCallback(MoveGroupSequenceActionServer::GoalHandle& goal_handle)
+{
+  goal_handle.setAccepted("This goal has been accepted by the action server");
+  const moveit_msgs::MoveGroupSequenceGoalConstPtr& goal = goal_handle.getGoal();
+
+  setMoveState(move_group::PLANNING, goal_handle);
+
+  moveit_msgs::MoveGroupSequenceResult action_res;
 
   // Handle empty requests
   if (goal->request.items.empty())
   {
     ROS_WARN("Received empty request. That's ok but maybe not what you intended.");
-    setMoveState(move_group::IDLE);
-    moveit_msgs::MoveGroupSequenceResult action_res;
+    setMoveState(move_group::IDLE, goal_handle);
     action_res.response.error_code.val = moveit_msgs::MoveItErrorCodes::SUCCESS;
-    move_action_server_->setSucceeded(action_res, "Received empty request.");
+    goal_handle.setSucceeded(action_res, "Received empty request.");
     return;
   }
 
@@ -90,7 +236,6 @@ void MoveGroupSequenceAction::executeSequenceCallback(const moveit_msgs::MoveGro
   context_->planning_scene_monitor_->waitForCurrentRobotState(ros::Time::now());
   context_->planning_scene_monitor_->updateFrameTransforms();
 
-  moveit_msgs::MoveGroupSequenceResult action_res;
   if (goal->planning_options.plan_only || !context_->allow_trajectory_execution_)
   {
     if (!goal->planning_options.plan_only)
@@ -101,30 +246,33 @@ void MoveGroupSequenceAction::executeSequenceCallback(const moveit_msgs::MoveGro
   }
   else
   {
-    executeSequenceCallbackPlanAndExecute(goal, action_res);
+    executeSequenceCallbackPlanAndExecute(goal_handle, action_res);
   }
 
-  switch (action_res.response.error_code.val)
+  if (isActive(goal_handle))
   {
-    case moveit_msgs::MoveItErrorCodes::SUCCESS:
-      move_action_server_->setSucceeded(action_res, "Success");
-      break;
-    case moveit_msgs::MoveItErrorCodes::PREEMPTED:
-      move_action_server_->setPreempted(action_res, "Preempted");
-      break;
-    default:
-      move_action_server_->setAborted(action_res, "See error code for more information");
-      break;
+    switch (action_res.response.error_code.val)
+    {
+      case moveit_msgs::MoveItErrorCodes::SUCCESS:
+        goal_handle.setSucceeded(action_res, "Success");
+        break;
+      case moveit_msgs::MoveItErrorCodes::PREEMPTED:
+        goal_handle.setCanceled(action_res, "Preempted");
+        break;
+      default:
+        goal_handle.setAborted(action_res, "See error code for more information");
+        break;
+    }
+    setMoveState(move_group::IDLE, goal_handle);
   }
-
-  setMoveState(move_group::IDLE);
 }
 
 void MoveGroupSequenceAction::executeSequenceCallbackPlanAndExecute(
-    const moveit_msgs::MoveGroupSequenceGoalConstPtr& goal, moveit_msgs::MoveGroupSequenceResult& action_res)
+    MoveGroupSequenceActionServer::GoalHandle& goal_handle, moveit_msgs::MoveGroupSequenceResult& action_res)
 {
   ROS_INFO("Combined planning and execution request received for "
            "MoveGroupSequenceAction.");
+  const moveit_msgs::MoveGroupSequenceGoalConstPtr& goal = goal_handle.getGoal();
 
   plan_execution::PlanExecution::Options opt;
 
@@ -136,10 +284,10 @@ void MoveGroupSequenceAction::executeSequenceCallbackPlanAndExecute(
   opt.replan_ = goal->planning_options.replan;
   opt.replan_attempts_ = goal->planning_options.replan_attempts;
   opt.replan_delay_ = goal->planning_options.replan_delay;
-  opt.before_execution_callback_ = [this] { startMoveExecutionCallback(); };
+  opt.before_execution_callback_ = [this, &goal_handle] { startMoveExecutionCallback(goal_handle); };
 
-  opt.plan_callback_ = [this, &request = goal->request](plan_execution::ExecutableMotionPlan& plan) {
-    return planUsingSequenceManager(request, plan);
+  opt.plan_callback_ = [this, &request = goal->request, &goal_handle](plan_execution::ExecutableMotionPlan& plan) {
+    return planUsingSequenceManager(request, plan, goal_handle);
   };
 
   if (goal->planning_options.look_around && context_->plan_with_sensing_)
@@ -244,9 +392,10 @@ void MoveGroupSequenceAction::executeMoveCallbackPlanOnly(const moveit_msgs::Mov
 }
 
 bool MoveGroupSequenceAction::planUsingSequenceManager(const moveit_msgs::MotionSequenceRequest& req,
-                                                       plan_execution::ExecutableMotionPlan& plan)
+                                                       plan_execution::ExecutableMotionPlan& plan,
+                                                       MoveGroupSequenceActionServer::GoalHandle& goal_handle)
 {
-  setMoveState(move_group::PLANNING);
+  setMoveState(move_group::PLANNING, goal_handle);
 
   planning_scene_monitor::LockedPlanningSceneRO lscene(plan.planning_scene_monitor_);
   RobotTrajCont traj_vec;
@@ -292,21 +441,17 @@ bool MoveGroupSequenceAction::planUsingSequenceManager(const moveit_msgs::Motion
   return true;
 }
 
-void MoveGroupSequenceAction::startMoveExecutionCallback()
+void MoveGroupSequenceAction::startMoveExecutionCallback(MoveGroupSequenceActionServer::GoalHandle& goal_handle)
 {
-  setMoveState(move_group::MONITOR);
+  setMoveState(move_group::MONITOR, goal_handle);
 }
 
-void MoveGroupSequenceAction::preemptMoveCallback()
-{
-  context_->plan_execution_->stop();
-}
-
-void MoveGroupSequenceAction::setMoveState(move_group::MoveGroupState state)
+void MoveGroupSequenceAction::setMoveState(move_group::MoveGroupState state,
+                                           MoveGroupSequenceActionServer::GoalHandle& goal_handle)
 {
   move_state_ = state;
   move_feedback_.state = stateToStr(state);
-  move_action_server_->publishFeedback(move_feedback_);
+  goal_handle.publishFeedback(move_feedback_);
 }
 
 }  // namespace pilz_industrial_motion_planner
