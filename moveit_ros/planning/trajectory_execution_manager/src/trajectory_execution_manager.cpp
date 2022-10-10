@@ -261,9 +261,11 @@ void TrajectoryExecutionManager::runEventManager()
   ROS_INFO_NAMED(LOGNAME, "Starting trajectory execution event manager");
   while (run_event_manager_)  // run_event_manager
   {
-    std::unique_lock<std::mutex> ulock(event_manager_mutex_, std::try_to_lock);
-    while (events_queue_.empty() && run_event_manager_ && !stop_execution_)
-      event_manager_condition_.wait(ulock);
+    {
+      std::unique_lock<std::mutex> ulock(event_manager_mutex_, std::try_to_lock);
+      while (events_queue_.empty() && run_event_manager_ && !stop_execution_)
+        event_manager_condition_.wait(ulock);
+    }
 
     // If stop-flag is set, break out
     if (stop_execution_ || !run_event_manager_)
@@ -341,6 +343,16 @@ void TrajectoryExecutionManager::runEventManager()
           // Just cancel other controller handles required by this trajectory
           ROS_INFO_NAMED(LOGNAME, "Event EXECUTION_TIMEOUT");
           execution_status = moveit_controller_manager::ExecutionStatus::TIMED_OUT;
+          for (auto handle : required_handles)
+            handle->cancelExecution();
+          break;
+        }
+        case EventType::EXECUTION_CANCELLATION_REQUEST:
+        {
+          ROS_INFO_NAMED(LOGNAME, "Event EXECUTION_CANCELLATION_REQUEST");
+          context_ptr->execution_duration_timer_.stop();
+          context_ptr->active_controllers_count_ -= 1;
+          execution_status = moveit_controller_manager::ExecutionStatus::ABORTED;
           for (auto handle : required_handles)
             handle->cancelExecution();
           break;
@@ -1174,6 +1186,46 @@ void TrajectoryExecutionManager::stopExecution(bool auto_clear)
     ROS_INFO_NAMED(LOGNAME, "Stopped trajectory execution.");
     if (auto_clear)
       clear();
+  }
+}
+
+void TrajectoryExecutionManager::stopExecution(const moveit_msgs::RobotTrajectory& req_trajectory)
+{
+  std::vector<moveit_msgs::RobotTrajectory> trajs = { req_trajectory };
+  stopExecution(trajs);
+}
+
+void TrajectoryExecutionManager::stopExecution(const std::vector<moveit_msgs::RobotTrajectory>& req_trajectories)
+{
+  ROS_INFO_NAMED(LOGNAME, "StopExecution(std::vector<moveit_msgs::RobotTrajectory>)");
+  for (auto& trajectory_sequence : active_trajectory_sequences_)
+  {
+    if (trajectory_sequence->contexts_.size() == req_trajectories.size())
+    {
+      bool trajectory_found = true;
+      for (std::size_t i = 0; i < req_trajectories.size(); i++)
+      {
+        if (trajectory_sequence->contexts_[i]->trajectory_ != req_trajectories[i])
+        {
+          trajectory_found = false;
+          break;
+        }
+      }
+      if (trajectory_found)
+      {
+        std::weak_ptr<SequentialTrajectoryExecutionContext> trajectory_sequence_weak_ptr = trajectory_sequence;
+        auto index = trajectory_sequence->contexts_.size() - trajectory_sequence->remaining_trajectories_count_;
+        std::weak_ptr<TrajectoryExecutionContext> context_weak_ptr = trajectory_sequence->contexts_[index];
+        auto context_pair = std::make_pair(trajectory_sequence_weak_ptr, context_weak_ptr);
+
+        TrajectoryExecutionEvent event = { EventType::EXECUTION_CANCELLATION_REQUEST, context_pair,
+                                           moveit_controller_manager::ExecutionStatus::ABORTED };
+        std::lock_guard<std::mutex> slock(events_queue_mutex_);
+        events_queue_.push_back(std::make_shared<TrajectoryExecutionEvent>(event));
+        event_manager_condition_.notify_all();
+        break;
+      }
+    }
   }
 }
 

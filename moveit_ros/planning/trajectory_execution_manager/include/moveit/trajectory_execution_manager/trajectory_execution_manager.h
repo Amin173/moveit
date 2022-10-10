@@ -84,6 +84,9 @@ public:
     /** \brief The monitor trajectory execution timer  */
     EXECUTION_TIMEOUT = 2,
 
+    /** \brief Cancellation requested by user  */
+    EXECUTION_CANCELLATION_REQUEST = 3,
+
   };
 
   /// Data structure that represents information necessary to execute a trajectory
@@ -275,6 +278,12 @@ public:
 
   /// Stop whatever executions are active, if any
   void stopExecution(bool auto_clear = true);
+
+  /// Stop executions of a given trajectory, if active
+  void stopExecution(const moveit_msgs::RobotTrajectory& req_trajectory);
+
+  /// Stop executions of a given sequence of trajectories, if active
+  void stopExecution(const std::vector<moveit_msgs::RobotTrajectory>& req_trajectories);
 
   /// Clear the trajectories to execute
   void clear();
