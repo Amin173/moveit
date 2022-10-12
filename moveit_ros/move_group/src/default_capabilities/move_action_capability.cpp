@@ -207,7 +207,6 @@ void MoveGroupMoveAction::cancelCallback(MoveGroupActionServer::GoalHandle goal_
 
 void MoveGroupMoveAction::executeMoveCallback(std::shared_ptr<MoveGroupActionServer::GoalHandle>& goal_handle_ptr)
 {
-  goal_handle.setAccepted("This goal has been accepted by the action server");
   goal_handle_ptr->setAccepted("This goal has been accepted by the action server");
   const moveit_msgs::MoveGroupGoalConstPtr& goal = goal_handle_ptr->getGoal();
 

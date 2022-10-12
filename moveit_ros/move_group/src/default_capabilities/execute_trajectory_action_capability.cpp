@@ -157,8 +157,7 @@ void MoveGroupExecuteTrajectoryAction::executeLoop()
 
         active_goals_mutex_.lock();
         active_goals_.emplace(
-            std::make_pair(new_goal, std::make_unique<std::thread>([this, &new_goal]() {
-          executePath(new_goal); })));
+            std::make_pair(new_goal, std::make_unique<std::thread>([this, &new_goal]() { executePath(new_goal); })));
         active_goals_mutex_.unlock();
       }
     }
