@@ -39,7 +39,7 @@ POSSIBILITY OF SUCH DAMAGE.
     <arg name="pipeline" value="pilz_industrial_motion_planner" />
   </include>
 
-  <param name="move_group/trajectory_execution/allow_simultaneous_execution" value="false"/>
+  <param name="move_group/trajectory_execution/enable_simultaneous_execution" value="false"/>
 
   <!-- run test -->
   <test pkg="pilz_industrial_motion_planner" test-name="integrationtest_sequence_action_frankaemika_panda"

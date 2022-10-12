@@ -38,7 +38,7 @@ POSSIBILITY OF SUCH DAMAGE.
     <arg name="fake_execution_type" value="last point" />
   </include>
 
-  <param name="move_group/trajectory_execution/allow_simultaneous_execution" value="false"/>
+  <param name="move_group/trajectory_execution/enable_simultaneous_execution" value="false"/>
 
   <!-- run test -->
   <test pkg="pilz_industrial_motion_planner" test-name="integrationtest_sequence_action" type="integrationtest_sequence_action" time-limit="300.0">

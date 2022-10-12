@@ -121,7 +121,7 @@ void MoveGroupSequenceAction::executeLoop()
       if (new_goals_.empty())
         return;
 
-      if (context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+      if (context_->trajectory_execution_manager_->getEnableSimultaneousExecution())
       {
         for (auto ng : new_goals_)
         {

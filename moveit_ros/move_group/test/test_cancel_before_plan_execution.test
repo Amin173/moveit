@@ -3,7 +3,7 @@
 		<arg name="use_rviz" value="false"/>
 	</include>
 
-    <param name="move_group/trajectory_execution/allow_simultaneous_execution" value="false"/>
+    <param name="move_group/trajectory_execution/enable_simultaneous_execution" value="false"/>
 
 	<test test-name="cancel_before_plan_execution" pkg="moveit_ros_move_group" type="test_cancel_before_plan_execution.py"/>
 </launch>

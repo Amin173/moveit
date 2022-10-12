@@ -91,8 +91,6 @@ void MoveGroupExecuteTrajectoryAction::executeLoop()
         break;
     }
 
-    clearInactiveGoals();
-
     {
       std::unique_lock<std::mutex> ulock(goal_mutex_);
 
@@ -126,13 +124,11 @@ void MoveGroupExecuteTrajectoryAction::executeLoop()
         continue;
       }
 
-      if (context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+      if (context_->trajectory_execution_manager_->getEnableSimultaneousExecution())
       {
         for (auto ng : new_goals_)
         {
-          auto goal = *ng;
           active_goals_.emplace(std::make_pair(ng, std::make_unique<std::thread>([this, &ng]() { executePath(ng); })));
-              std::make_pair(std::move(ng), std::make_unique<std::thread>([this, &goal]() { executePath(goal); })));
         }
         new_goals_.clear();
       }
@@ -160,9 +156,9 @@ void MoveGroupExecuteTrajectoryAction::executeLoop()
         current_goal_ = *new_goal;
 
         active_goals_mutex_.lock();
-        active_goals_.emplace(std::make_pair(std::move(new_goal),
         active_goals_.emplace(
-            std::make_pair(new_goal, std::make_unique<std::thread>([this, &new_goal]() { executePath(new_goal); })));
+            std::make_pair(new_goal, std::make_unique<std::thread>([this, &new_goal]() {
+          executePath(new_goal); })));
         active_goals_mutex_.unlock();
       }
     }
@@ -227,7 +223,7 @@ void MoveGroupExecuteTrajectoryAction::executePath(
 
   goal_handle_ptr->setAccepted("This goal has been accepted by the action server");
 
-  if (!context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+  if (!context_->trajectory_execution_manager_->getEnableSimultaneousExecution())
     context_->trajectory_execution_manager_->clear();
 
   auto executionCallback = [this, goal_handle_ptr](const moveit_controller_manager::ExecutionStatus& status) {
@@ -240,7 +236,7 @@ void MoveGroupExecuteTrajectoryAction::executePath(
   if (context_->trajectory_execution_manager_->push(goal_handle_ptr->getGoal()->trajectory, "", executionCallback))
   {
     setExecuteTrajectoryState(MONITOR, *goal_handle_ptr);
-    if (!context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+    if (!context_->trajectory_execution_manager_->getEnableSimultaneousExecution())
       context_->trajectory_execution_manager_->execute(executionCallback, true);
   }
   else

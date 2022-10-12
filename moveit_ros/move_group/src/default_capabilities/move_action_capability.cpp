@@ -114,11 +114,10 @@ void MoveGroupMoveAction::executeLoop()
       if (new_goals_.empty())
         return;
 
-      if (context_->trajectory_execution_manager_->getAllowSimultaneousExecution())
+      if (context_->trajectory_execution_manager_->getEnableSimultaneousExecution())
       {
         for (auto ng : new_goals_)
         {
-          auto goal = *ng;
           active_goals_.emplace(
               std::make_pair(ng, std::make_unique<std::thread>([this, &ng]() { executeMoveCallback(ng); })));
         }
@@ -242,7 +241,7 @@ void MoveGroupMoveAction::executeMoveCallback(std::shared_ptr<MoveGroupActionSer
   setMoveState(IDLE, *goal_handle_ptr);
 
   preempt_requested_ = false;
-  execute_condition_.notify_all(); 
+  execute_condition_.notify_all();
 }
 
 void MoveGroupMoveAction::executeMoveCallbackPlanAndExecute(MoveGroupActionServer::GoalHandle& goal_handle,
